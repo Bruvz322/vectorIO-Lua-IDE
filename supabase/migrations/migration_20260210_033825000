@@ -1,0 +1,179 @@
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'menu_dev',
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT chk_role CHECK (role IN ('admin', 'menu_dev'))
+);
+
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  ip_address TEXT,
+  browser_fingerprint TEXT,
+  hwid TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE menus (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  owner_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'pending_approval',
+  api_key_dev TEXT UNIQUE DEFAULT encode(gen_random_bytes(32), 'hex'),
+  api_key_build TEXT UNIQUE DEFAULT encode(gen_random_bytes(32), 'hex'),
+  payment_api_key TEXT UNIQUE DEFAULT encode(gen_random_bytes(32), 'hex'),
+  dev_code TEXT DEFAULT '',
+  build_code TEXT DEFAULT '',
+  blob_storage_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT chk_menu_status CHECK (status IN ('pending_approval','active','rejected','maintenance','paused','terminated','deletion_requested'))
+);
+
+CREATE TABLE menu_users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  menu_id UUID NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  hwid TEXT,
+  is_blacklisted BOOLEAN DEFAULT false,
+  blacklist_reason TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(menu_id, email)
+);
+
+CREATE TABLE tickets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  creator_id UUID NOT NULL REFERENCES users(id),
+  menu_id UUID REFERENCES menus(id),
+  subject TEXT NOT NULL,
+  description TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  assigned_admin_id UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT chk_ticket_status CHECK (status IN ('open','in_progress','resolved','closed'))
+);
+
+CREATE TABLE ticket_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  sender_id UUID NOT NULL REFERENCES users(id),
+  message TEXT NOT NULL,
+  file_url TEXT,
+  file_expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE menu_deletion_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  menu_id UUID NOT NULL REFERENCES menus(id),
+  requester_id UUID NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  admin_response TEXT,
+  transfer_to_email TEXT,
+  admin_id UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT chk_deletion_status CHECK (status IN ('pending','approved','rejected','transferred'))
+);
+
+CREATE TABLE audit_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id),
+  action TEXT NOT NULL,
+  details JSONB DEFAULT '{}',
+  ip_address TEXT,
+  browser_fingerprint TEXT,
+  hwid TEXT,
+  entity_type TEXT,
+  entity_id UUID,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE debug_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  menu_id UUID NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
+  menu_user_id UUID REFERENCES menu_users(id),
+  details TEXT NOT NULL,
+  ip_address TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE menus ENABLE ROW LEVEL SECURITY;
+ALTER TABLE menu_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ticket_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE menu_deletion_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE debug_logs ENABLE ROW LEVEL SECURITY;
+
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX idx_menus_owner ON menus(owner_id);
+CREATE INDEX idx_menus_status ON menus(status);
+CREATE INDEX idx_menus_api_dev ON menus(api_key_dev);
+CREATE INDEX idx_menus_api_build ON menus(api_key_build);
+CREATE INDEX idx_menus_payment ON menus(payment_api_key);
+CREATE INDEX idx_menu_users_menu ON menu_users(menu_id);
+CREATE INDEX idx_menu_users_email ON menu_users(email);
+CREATE INDEX idx_tickets_creator ON tickets(creator_id);
+CREATE INDEX idx_ticket_msgs_ticket ON ticket_messages(ticket_id);
+CREATE INDEX idx_audit_user ON audit_logs(user_id);
+CREATE INDEX idx_audit_created ON audit_logs(created_at);
+CREATE INDEX idx_debug_menu ON debug_logs(menu_id);
+CREATE INDEX idx_deletion_menu ON menu_deletion_requests(menu_id);
+
+CREATE OR REPLACE FUNCTION verify_password(p_email TEXT, p_password TEXT)
+RETURNS BOOLEAN AS $$
+DECLARE stored_hash TEXT;
+BEGIN
+  SELECT password_hash INTO stored_hash FROM users WHERE LOWER(email) = LOWER(p_email) AND is_active = true;
+  IF stored_hash IS NULL THEN RETURN FALSE; END IF;
+  RETURN stored_hash = crypt(p_password, stored_hash);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION create_user_with_password(p_email TEXT, p_password TEXT, p_display_name TEXT, p_role TEXT DEFAULT 'menu_dev')
+RETURNS UUID AS $$
+DECLARE new_id UUID;
+BEGIN
+  INSERT INTO users (email, password_hash, display_name, role)
+  VALUES (LOWER(p_email), crypt(p_password, gen_salt('bf')), p_display_name, p_role)
+  RETURNING id INTO new_id;
+  RETURN new_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION clean_expired_sessions()
+RETURNS void AS $$
+BEGIN DELETE FROM sessions WHERE expires_at < NOW();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tr_users_updated BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER tr_menus_updated BEFORE UPDATE ON menus FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER tr_menu_users_updated BEFORE UPDATE ON menu_users FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER tr_tickets_updated BEFORE UPDATE ON tickets FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER tr_deletion_updated BEFORE UPDATE ON menu_deletion_requests FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+INSERT INTO users (email, password_hash, display_name, role)
+VALUES ('admin@luaide.com', crypt('admin123', gen_salt('bf')), 'System Admin', 'admin');
