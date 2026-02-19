@@ -57,7 +57,7 @@ export default function Sidebar({ activeTab, onTabChange, collapsed, onToggleCol
               <Terminal className="w-4 h-4 text-primary" />
             </div>
             <span className="font-bold text-foreground text-sm tracking-tight">
-              Lua<span className="text-primary">IDE</span>
+              Vector<span className="text-primary">IDE</span>
             </span>
           </div>
         )}
