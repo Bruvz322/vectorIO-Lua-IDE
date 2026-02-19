@@ -50,7 +50,7 @@ export default function LoginPage() {
             <Terminal className="w-5 h-5 text-primary" />
           </div>
           <h1 className="text-2xl font-bold text-foreground tracking-tight">
-            Lua<span className="text-primary">IDE</span>
+            Vector<span className="text-primary">IDE</span>
           </h1>
         </div>
 
